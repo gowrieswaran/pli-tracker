@@ -1,1 +1,1 @@
-web: python pli_service.py
+web: gunicorn --bind 0.0.0.0:$PORT pli_service:app
