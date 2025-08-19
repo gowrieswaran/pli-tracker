@@ -1,0 +1,117 @@
+# pli_service.py
+from flask import Flask, jsonify
+import requests
+import sqlite3
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz
+from urllib.parse import urljoin
+from datetime import datetime
+
+# ---------------- CONFIG ---------------- #
+SOURCES = [
+    "https://dpiit.gov.in/whats-new",
+    "https://pib.gov.in/PressReleasePage.aspx"
+]
+
+COMPANIES = [
+    {"ticker": "DIXON", "name": "Dixon Technologies", "sector": "Electronics",
+     "keywords": ["mobile", "electronics", "led", "consumer electronics"]},
+    {"ticker": "RIL", "name": "Reliance Industries", "sector": "Energy/EV",
+     "keywords": ["battery", "acc", "electric vehicle", "petrochemical"]},
+    {"ticker": "SUNPHARMA", "name": "Sun Pharma", "sector": "Pharma",
+     "keywords": ["pharma", "drug", "API", "formulation"]},
+]
+
+SLACK_WEBHOOK = None
+
+# ---------------- DB INIT ---------------- #
+conn = sqlite3.connect("pli_tracker.db", check_same_thread=False)
+conn.execute("""CREATE TABLE IF NOT EXISTS seen_pages(
+    url TEXT PRIMARY KEY,
+    title TEXT,
+    snippet TEXT,
+    fetched_at DATETIME
+)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS matches(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT,
+    company TEXT,
+    score REAL,
+    evidence TEXT,
+    matched_at DATETIME
+)""")
+conn.commit()
+
+# ---------------- FUNCTIONS ---------------- #
+def fetch_html(url):
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "PLI-Tracker/1.0"})
+    resp.raise_for_status()
+    return resp.text
+
+def extract_links(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for a in soup.find_all("a"):
+        text = a.get_text(strip=True)
+        href = a.get("href")
+        if href and text:
+            items.append((text, urljoin(base_url, href)))
+    return items
+
+def process_source(source_url):
+    results = []
+    try:
+        html = fetch_html(source_url)
+    except Exception as e:
+        return [{"error": f"Error fetching {source_url}: {e}"}]
+
+    for title, link in extract_links(html, source_url):
+        if conn.execute("SELECT 1 FROM seen_pages WHERE url=?", (link,)).fetchone():
+            continue
+
+        conn.execute("INSERT INTO seen_pages(url, title, snippet, fetched_at) VALUES (?,?,?,?)",
+                     (link, title, title[:200], datetime.utcnow()))
+        conn.commit()
+
+        if "PLI" in title.upper() or "PRODUCTION LINKED" in title.upper():
+            try:
+                detail_html = fetch_html(link)
+                detail_text = BeautifulSoup(detail_html, "html.parser").get_text(" ", strip=True)
+            except Exception:
+                detail_text = title
+
+            for company in COMPANIES:
+                best_score = 0
+                for kw in company["keywords"]:
+                    score = fuzz.partial_ratio(kw.lower(), detail_text.lower())
+                    best_score = max(best_score, score)
+
+                if best_score >= 60:
+                    evidence = f"Keyword match score {best_score}"
+                    conn.execute("INSERT INTO matches(url, company, score, evidence, matched_at) VALUES (?,?,?,?,?)",
+                                 (link, company["name"], best_score, evidence, datetime.utcnow()))
+                    conn.commit()
+                    results.append({
+                        "company": company["name"],
+                        "score": best_score,
+                        "url": link,
+                        "title": title
+                    })
+    return results
+
+# ---------------- FLASK APP ---------------- #
+app = Flask(__name__)
+
+@app.route("/run", methods=["GET"])
+def run_scraper():
+    all_results = []
+    for src in SOURCES:
+        all_results.extend(process_source(src))
+    return jsonify({
+        "status": "success",
+        "matches_found": len(all_results),
+        "results": all_results
+    })
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
